@@ -53,12 +53,14 @@ public class DnsVpnService extends VpnService implements NetworkManager.NetworkL
   private static final String LOG_TAG = "DnsVpnService";
   private static final int SERVICE_ID = 1; // Only has to be unique within this app.
   private static final String CHANNEL_ID = "vpn";
+  private static final String NO_PENDING_CONNECTION = "This value is not a possible URL.";
 
   private NetworkManager networkManager;
   private VpnAdapter vpnAdapter = null;
   private ServerConnection serverConnection = null;
   private boolean networkConnected = false;
   private String url = null;
+  private String pendingUrl = NO_PENDING_CONNECTION;
 
   private FirebaseAnalytics firebaseAnalytics;
 
@@ -166,9 +168,23 @@ public class DnsVpnService extends VpnService implements NetworkManager.NetworkL
   }
 
   @WorkerThread
-  private synchronized void updateServerConnection() {
-    if (serverConnection != null && TextUtils.equals(url, serverConnection.getUrl())) {
-      return;
+  private void updateServerConnection() {
+    synchronized (this) {
+      if (serverConnection != null && TextUtils.equals(url, serverConnection.getUrl())) {
+        // Connection state is consistent.  No need for an update.
+        return;
+      }
+
+      if (TextUtils.equals(url, pendingUrl)) {
+        // There's a pending update for this URL already.
+        return;
+      }
+
+      // Indicate that there is a pending update.
+      pendingUrl = url;
+
+      // Stop using the old connection if present.
+      serverConnection = null;
     }
 
     // Inform the controller that we are starting a new connection.
@@ -179,15 +195,16 @@ public class DnsVpnService extends VpnService implements NetworkManager.NetworkL
     // the current DNS configuration.
     Bundle bootstrap = new Bundle();
     long beforeBootstrap = SystemClock.elapsedRealtime();
+    final ServerConnection newConnection;
     if (url == null || url.isEmpty()) {
       // Use the Google Resolver
       AssetManager assets = this.getApplicationContext().getAssets();
-      serverConnection = GoogleServerConnection.get(new GoogleServerDatabase(this, assets));
+      newConnection = GoogleServerConnection.get(new GoogleServerDatabase(this, assets));
     } else {
-      serverConnection = StandardServerConnection.get(url);
+      newConnection = StandardServerConnection.get(url);
     }
 
-    if (serverConnection != null) {
+    if (newConnection != null) {
       controller.onConnectionStateChanged(this, ServerConnection.State.WORKING);
 
       // Measure bootstrap delay.
@@ -197,6 +214,21 @@ public class DnsVpnService extends VpnService implements NetworkManager.NetworkL
     } else {
       controller.onConnectionStateChanged(this, ServerConnection.State.FAILING);
       firebaseAnalytics.logEvent(Names.BOOTSTRAP_FAILED.name(), bootstrap);
+    }
+
+    synchronized (this) {
+      pendingUrl = NO_PENDING_CONNECTION;
+
+      if (serverConnection != null && TextUtils.equals(url, serverConnection.getUrl())) {
+        // Connection state has somehow become consistent, so an update is no longer needed.
+        return;
+      }
+
+      if (newConnection == null || TextUtils.equals(url, newConnection.getUrl())) {
+        // Current connection state is not consistent, but newConnection is consistent with the
+        // current URL, so perform the update.
+        serverConnection = newConnection;
+      }
     }
   }
 
@@ -211,9 +243,6 @@ public class DnsVpnService extends VpnService implements NetworkManager.NetworkL
       return;
     }
 
-    // The server connection setup process may rely on DNS, so it has to occur before we set up
-    // the VPN.
-    updateServerConnection();
     startVpnAdapter();
 
     DnsVpnController.getInstance().onStartComplete(this, vpnAdapter != null);
@@ -438,6 +467,7 @@ public class DnsVpnService extends VpnService implements NetworkManager.NetworkL
     new Thread(
         new Runnable() {
           public void run() {
+            updateServerConnection();
             startVpn();
           }
         }, "startVpn-onNetworkConnected")
